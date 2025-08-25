@@ -1,0 +1,149 @@
+name: "Issue を作成した時に Project & Status を自動設定"
+# 新しい Issue が作成された際に、自動的に指定された Project に追加し、
+# Status フィールドを DEFAULT_STATUS で設定された値（デフォルト: "API TODO"）に更新します。
+
+# ------------------------------------------------------------
+# トリガー
+# ------------------------------------------------------------
+# 新しい Issue が作成された際に実行する
+on:
+  issues:
+    types: [opened]
+
+# ------------------------------------------------------------
+# 権限設定
+# ------------------------------------------------------------
+# 実際の Project への書き込みは PAT (ADD_TO_PROJECT_PAT) を使うため、
+# デフォルト GITHUB_TOKEN 側の権限は最低限で OK
+permissions:
+  contents: read
+  issues: read
+
+jobs:
+  add-and-set-status:
+    runs-on: ubuntu-latest
+
+    # --------------------------------------------------------
+    # 共通環境変数
+    # --------------------------------------------------------
+    env:
+      # Project の URL（固定値で直書きOK。private なのでセキュリティリスクはなし）
+      PROJECT_URL: "https://github.com/users/fumi238000/projects/9/views/2"
+
+      # プロジェクト内の「Status」フィールド名（UIで名称変更している場合はここを変える）
+      STATUS_FIELD_NAME: "Status"
+
+      # 新規 Issue 作成時にセットしたいデフォルトのステータス名
+      DEFAULT_STATUS: "Todo"
+
+    steps:
+      # ------------------------------------------------------
+      # 1. Issue を指定した Project に追加
+      # ------------------------------------------------------
+      - name: Add issue to Project (v2)
+        uses: actions/add-to-project@v1.0.2
+        with:
+          project-url: ${{ env.PROJECT_URL }}
+          # Org Project へ書き込みできる Personal Access Token を利用
+          github-token: ${{ secrets.ADD_TO_PROJECT_PAT }}
+
+      # ------------------------------------------------------
+      # 2. Project の Status フィールドを更新
+      # ------------------------------------------------------
+      - name: Set Project Status to ${{ env.DEFAULT_STATUS }}
+        uses: actions/github-script@v7
+        env:
+          PROJECT_URL: ${{ env.PROJECT_URL }}
+          STATUS_FIELD_NAME: ${{ env.STATUS_FIELD_NAME }}
+          DEFAULT_STATUS: ${{ env.DEFAULT_STATUS }}
+        with:
+          github-token: ${{ secrets.ADD_TO_PROJECT_PAT }}
+          script: |
+            const issueNodeId = context.payload.issue.node_id;
+
+            // --------------------------------------------------
+            // Project URL から org と project number を抽出
+            // --------------------------------------------------
+            const url = process.env.PROJECT_URL; // https://github.com/orgs/<ORG>/projects/<NUM>
+            const m = url.match(/orgs\/([^/]+)\/projects\/(\d+)/);
+            if (!m) throw new Error(`PROJECT_URL format invalid: ${url}`);
+            const org = m[1];
+            const projectNumber = parseInt(m[2], 10);
+
+            // --------------------------------------------------
+            // Org + Project 情報を取得（id, フィールド一覧, option 等）
+            // --------------------------------------------------
+            const getProject = await github.graphql(`
+              query($org:String!, $number:Int!) {
+                organization(login:$org){
+                  projectV2(number:$number){
+                    id
+                    fields(first:100){
+                      nodes{
+                        __typename
+                        ... on ProjectV2SingleSelectField {
+                          id
+                          name
+                          options{ id name }
+                        }
+                      }
+                    }
+                  }
+                }
+              }`, { org, number: projectNumber });
+
+            const project = getProject.organization?.projectV2;
+            if (!project) throw new Error(`Project not found: ${org} #${projectNumber}`);
+
+            // --------------------------------------------------
+            // 指定されたフィールド（Status 等）を探す
+            // --------------------------------------------------
+            const fieldName = process.env.STATUS_FIELD_NAME || "Status";
+            const statusField = project.fields.nodes.find(
+              f => f.__typename === "ProjectV2SingleSelectField" && f.name === fieldName
+            );
+            if (!statusField) throw new Error(`Single-select field "${fieldName}" not found`);
+
+            // --------------------------------------------------
+            // 指定されたステータス（例: "API TODO"）を option から探す
+            // --------------------------------------------------
+            const targetStatus = process.env.DEFAULT_STATUS || "API TODO";
+            const option = statusField.options.find(o => o.name === targetStatus);
+            if (!option) {
+              const list = statusField.options.map(o=>o.name).join(", ");
+              throw new Error(`Status option "${targetStatus}" not found. Existing: [${list}]`);
+            }
+
+            // --------------------------------------------------
+            // Project に item として追加（既にあれば同じ itemId が返る）
+            // --------------------------------------------------
+            const addResp = await github.graphql(`
+              mutation($projectId:ID!, $contentId:ID!){
+                addProjectV2ItemById(input:{projectId:$projectId, contentId:$contentId}){
+                  item{ id }
+                }
+              }`, { projectId: project.id, contentId: issueNodeId });
+
+            const itemId = addResp.addProjectV2ItemById.item.id;
+
+            // --------------------------------------------------
+            // 追加した item の Status を更新
+            // --------------------------------------------------
+            await github.graphql(`
+              mutation($projectId:ID!, $itemId:ID!, $fieldId:ID!, $optionId:String!){
+                updateProjectV2ItemFieldValue(input:{
+                  projectId:$projectId,
+                  itemId:$itemId,
+                  fieldId:$fieldId,
+                  value:{ singleSelectOptionId:$optionId }
+                }){
+                  projectV2Item{ id }
+                }
+              }`, {
+                projectId: project.id,
+                itemId,
+                fieldId: statusField.id,
+                optionId: option.id
+              });
+
+            core.info(`Status set to "${targetStatus}" for project item ${itemId}`);
